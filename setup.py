@@ -7,5 +7,6 @@ setup(
     maintainer_email="jiminy.crist@gmail.com",
     license="BSD",
     packages=["eio"],
+    install_requires=["msgpack"],
     zip_safe=False,
 )
