@@ -24,22 +24,26 @@ class RPCServer(object):
             cls._handlers = set()
         cls._handlers.add(name)
 
+    async def handle_request(self, req):
+        try:
+            method, args, kwargs = req.content
+            if method in self._handlers:
+                handler = getattr(self, method)
+            else:
+                raise ValueError(f"Unknown RPC method {method}")
+            result = handler(*(args or ()), **(kwargs or {}))
+            if isawaitable(result):
+                result = await result
+        except Exception as exc:
+            if not req.is_info:
+                await req.error(exception=exc)
+
+        if not req.is_info:
+            await req.reply(result)
+
     async def handler(self, channel):
         async for req in channel:
-            try:
-                method, args, kwargs = req.content
-                if method in self._handlers:
-                    handler = getattr(self, method)
-                else:
-                    raise ValueError(f"Unknown RPC method {method}")
-                result = handler(*(args or ()), **(kwargs or {}))
-                if isawaitable(result):
-                    result = await result
-                if not req.one_way:
-                    await req.reply(result)
-            except Exception as exc:
-                if not req.one_way:
-                    await req.error(exception=exc)
+            await self.handle_request(req)
 
     async def start(self):
         self.server = await start_server(self.address, self.handler)

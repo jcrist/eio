@@ -11,10 +11,11 @@ __all__ = ('new_channel', 'start_server', 'Request', 'Channel', 'RemoteException
 
 
 # Message types
-REQUEST_REPLY = 0
-REQUEST_NO_REPLY = 1
-REPLY = 2
-ERROR = 3
+REQUEST = 0
+RESPONSE = 1
+ERROR = 2
+INFO = 3
+CANCEL = 4
 
 
 def _encode(data, _p=msgpack.Packer(use_bin_type=True)):
@@ -23,12 +24,7 @@ def _encode(data, _p=msgpack.Packer(use_bin_type=True)):
 
 class RemoteException(Exception):
     """A remote exception that occurs on a different machine"""
-    def __init__(self, message, address):
-        self.message = message
-        self.address = address
-
-    def __str__(self):
-        return f"Remote exception at address {self.address}:\n\n{self.message}"
+    pass
 
 
 async def new_channel(addr, *, loop=None, timeout=0, **kwargs):
@@ -155,10 +151,7 @@ class ChannelProtocol(asyncio.Protocol):
         self._unpacker.feed(data)
         for msg in self._unpacker:
             msg_type, msg_id, content = msg
-            try:
-                self.channel._append_msg(msg_type, msg_id, content)
-            except RuntimeError as exc:
-                self.channel._set_exception(exc)
+            self.channel._append_msg(msg_type, msg_id, content)
 
     def eof_received(self):
         self.channel._set_exception(ConnectionResetError())
@@ -176,7 +169,9 @@ class ChannelProtocol(asyncio.Protocol):
                 waiter.set_result(None)
 
     async def drain(self):
-        if self._paused and not self._connection_lost:
+        if self.transport.is_closing():
+            await asyncio.sleep(0, loop=self._loop)
+        elif self._paused and not self._connection_lost:
             self._drain_waiter = self._loop.create_future()
             await self._drain_waiter
 
@@ -194,6 +189,7 @@ class Channel(object):
         self._id_iter = itertools.count()
         self._active_reqs = {}
         self._queue = collections.deque()
+        self._yield_cycler = itertools.cycle(range(50))
         self._waiter = None
         self._exception = None
 
@@ -209,31 +205,28 @@ class Channel(object):
         self._transport.write(content)
         await self._protocol.drain()
 
-    async def send(self, msg, one_way=False):
-        """Send a request and optionally wait for a response.
+    async def _maybe_yield(self):
+        if not next(self._yield_cycler):
+            await asyncio.sleep(0, loop=self._loop)
 
-        Parameters
-        ----------
-        msg : object
-            The message contents. Can be any msgpack compatible object.
-        one_way : bool, optional
-            If True, this is a one-way request and no response will be waited
-            for. Default is False.
-        """
+    async def request(self, msg):
+        """Send a request message and wait for a response"""
         if self._exception is not None:
             raise self._exception
 
-        if one_way:
-            data = _encode((REQUEST_NO_REPLY, None, msg))
-        else:
-            msg_id = next(self._id_iter)
-            data = _encode((REQUEST_REPLY, msg_id, msg))
-            reply = self._active_reqs[msg_id] = self._loop.create_future()
-
+        msg_id = next(self._id_iter)
+        data = _encode((REQUEST, msg_id, msg))
+        reply = self._active_reqs[msg_id] = self._loop.create_future()
         await self._write_bytes(data)
+        return await reply
 
-        if not one_way:
-            return await reply
+    async def info(self, msg):
+        """Send an info message"""
+        if self._exception is not None:
+            raise self._exception
+        data = _encode((INFO, None, msg))
+        await self._write_bytes(data)
+        await self._maybe_yield()
 
     async def __aiter__(self):
         try:
@@ -275,14 +268,13 @@ class Channel(object):
         """
         self._close()
         try:
-            # TODO: drain here?
             futs = self._active_reqs.values()
             await asyncio.gather(*futs, return_exceptions=True)
         except asyncio.CancelledError:
             pass
 
     def _append_msg(self, msg_type, msg_id, content):
-        if msg_type == REQUEST_REPLY or msg_type == REQUEST_NO_REPLY:
+        if msg_type == REQUEST or msg_type == INFO:
             message = Request(self, content, msg_id)
             self._queue.append(message)
 
@@ -291,24 +283,23 @@ class Channel(object):
                 self._waiter = None
                 waiter.set_result(False)
 
-        elif msg_type == REPLY or msg_type == ERROR:
+        elif msg_type == RESPONSE or msg_type == ERROR:
             message = self._active_reqs.pop(msg_id)
-            if message.done():
-                errmsg = 'Request reply already set.'
-                if message.cancelled():
-                    errmsg = 'Request was cancelled.'
-                raise RuntimeError(errmsg)
-
-            if msg_type == REPLY:
-                message.set_result(content)
-            else:
-                addr = self._transport.get_extra_info('peername')
-                message.set_exception(RemoteException(content, addr))
+            if not message.done():
+                if msg_type == RESPONSE:
+                    message.set_result(content)
+                else:
+                    message.set_exception(RemoteException(content))
 
         else:
-            raise RuntimeError('Invalid message type %d' % msg_type)
+            self._set_exception(
+                RuntimeError('Invalid message type %d' % msg_type)
+            )
 
     def _set_exception(self, exc):
+        if self._exception:
+            return
+
         self._exception = exc
 
         waiter = self._waiter
@@ -326,12 +317,12 @@ class Channel(object):
 
 class Request(object):
     """A client request."""
-    __slots__ = ("_channel", "_content", "_msg_id")
+    __slots__ = ("_channel", "_content", "msg_id")
 
     def __init__(self, channel, content, msg_id):
         self._channel = channel
         self._content = content
-        self._msg_id = msg_id
+        self.msg_id = msg_id
 
     @property
     def content(self):
@@ -339,19 +330,19 @@ class Request(object):
         return self._content
 
     @property
-    def one_way(self):
-        """True if no reply is expected"""
-        return self._msg_id is None
+    def is_info(self):
+        """True if this is an info method, not a request"""
+        return self.msg_id is None
 
     async def reply(self, result):
         """Reply to the request with the provided result."""
-        if self.one_way:
+        if self.is_info:
             raise ValueError("Request doesn't expect a reply")
 
         if self._channel._exception:
             raise self._channel._exception
 
-        content = (REPLY, self._msg_id, result)
+        content = (RESPONSE, self.msg_id, result)
         try:
             content = _encode(content)
         except Exception as e:
@@ -369,7 +360,7 @@ class Request(object):
         exception : Exception, optional
             An exception ot use as the error message (including traceback).
         """
-        if self.one_way:
+        if self.is_info:
             raise ValueError("Request doesn't expect a reply")
 
         if self._channel._exception:
@@ -388,6 +379,6 @@ class Request(object):
         elif message is None:
             raise ValueError("Must provide either message or exception")
 
-        content = (ERROR, self._msg_id, message)
+        content = (ERROR, self.msg_id, message)
         content = _encode(content)
         await self._channel._write_bytes(content)

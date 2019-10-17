@@ -29,7 +29,7 @@ async def main(nclients, nbytes, duration, one_way):
 
 async def handler(channel):
     async for req in channel:
-        if req.one_way:
+        if req.is_info:
             pass
         else:
             await req.reply(1)
@@ -53,9 +53,14 @@ async def client(nbytes, duration, one_way):
     payload = os.urandom(nbytes)
 
     async with await new_channel(("127.0.0.1", 5556)) as channel:
-        while running:
-            await channel.send(payload, one_way=one_way)
-            count += 1
+        if one_way:
+            while running:
+                await channel.info(payload)
+                count += 1
+        else:
+            while running:
+                await channel.request(payload)
+                count += 1
 
     return count
 
