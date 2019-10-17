@@ -1,7 +1,6 @@
 import asyncio
 import collections
 import itertools
-import socket
 import time
 import traceback
 
@@ -18,7 +17,7 @@ REPLY = 2
 ERROR = 3
 
 
-def _encode(data, _p=msgpack.Packer()):
+def _encode(data, _p=msgpack.Packer(use_bin_type=True)):
     return _p.pack(data)
 
 
@@ -125,7 +124,7 @@ class ChannelProtocol(asyncio.Protocol):
         self.channel = None
         self._handler = handler
         self._loop = loop
-        self._unpacker = msgpack.Unpacker()
+        self._unpacker = msgpack.Unpacker(raw=False)
         self._paused = False
         self._drain_waiter = None
         self._connection_lost = None
@@ -304,7 +303,7 @@ class Channel(object):
                 message.set_result(content)
             else:
                 addr = self._transport.get_extra_info('peername')
-                message.set_exception(RemoteException(content.decode(), addr))
+                message.set_exception(RemoteException(content, addr))
 
         else:
             raise RuntimeError('Invalid message type %d' % msg_type)
