@@ -19,37 +19,6 @@ class Msg(enum.IntEnum):
     PROPOSE_REQ = 4
     PROPOSE_RESP = 5
 
-    @classmethod
-    def append_req(cls, term, prev_log_index, prev_log_term, entries, leader_commit):
-        return (
-            cls.APPEND_REQ,
-            term,
-            prev_log_index,
-            prev_log_term,
-            entries,
-            leader_commit
-        )
-
-    @classmethod
-    def append_resp(cls, term, success):
-        return (cls.APPEND_RESP, term, success)
-
-    @classmethod
-    def vote_req(cls, term, last_log_index, last_log_term):
-        return (cls.VOTE_REQ, term, last_log_index, last_log_term)
-
-    @classmethod
-    def vote_resp(cls, term, success):
-        return (cls.VOTE_RESP, term, success)
-
-    @classmethod
-    def propose_req(cls, items):
-        return (cls.PROPOSE_REQ, items)
-
-    @classmethod
-    def propose_resp(cls, success):
-        return (cls.PROPOSE_RESP, success)
-
 
 class Log(object):
     """A Raft log"""
@@ -94,7 +63,7 @@ class Peer(object):
         self.voted = voted
 
 
-class Node(object):
+class RaftNode(object):
     def __init__(self, node_id, peer_node_ids, heartbeat_ticks=1, election_ticks=None,
                  random_state=None):
         self.node_id = node_id
@@ -136,7 +105,33 @@ class Node(object):
         # Initialize as a follower
         self.become_follower()
 
-    def on_message(self, sender_id, msg):
+    def append_req(self, term, prev_log_index, prev_log_term, entries, leader_commit):
+        return (
+            Msg.APPEND_REQ,
+            self.node_id,
+            term,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit
+        )
+
+    def append_resp(self, term, success):
+        return (Msg.APPEND_RESP, self.node_id, term, success)
+
+    def vote_req(self, term, last_log_index, last_log_term):
+        return (Msg.VOTE_REQ, self.node_id, term, last_log_index, last_log_term)
+
+    def vote_resp(self, term, success):
+        return (Msg.VOTE_RESP, self.node_id, term, success)
+
+    def propose_req(self, items):
+        return (Msg.PROPOSE_REQ, self.node_id, items)
+
+    def propose_resp(self, success):
+        return (Msg.PROPOSE_RESP, self.node_id, success)
+
+    def on_message(self, msg):
         """Called when a new message is received.
 
         Returns
@@ -145,7 +140,7 @@ class Node(object):
             A list of ``(target, msg)`` pairs, where ``target`` is the node id
             to send to, and ``msg`` is the message to send.
         """
-        return self.handlers[msg[0]](sender_id, *msg[1:])
+        return self.handlers[msg[0]](*msg[1:])
 
     def on_tick(self):
         """Called on every time tick.
@@ -172,7 +167,7 @@ class Node(object):
                 msgs = [
                     (
                         node,
-                        Msg.vote_req(self.term, self.log.last_index, self.log.last_term)
+                        self.vote_req(self.term, self.log.last_index, self.log.last_term)
                     )
                     for node in self.peers
                 ]
@@ -208,11 +203,13 @@ class Node(object):
             peer.voted = False
 
     def become_follower(self, leader_id=None):
+        print("Now I'm a follower")
         self.reset()
         self.state = State.FOLLOWER
         self.leader_id = leader_id
 
     def become_candidate(self):
+        print("Now I'm a candidate")
         self.reset()
         self.state = State.CANDIDATE
         self.leader_id = None
@@ -221,6 +218,7 @@ class Node(object):
         self.vote_count = 1
 
     def become_leader(self):
+        print("Now I'm a leader")
         self.reset()
         self.state = State.LEADER
         self.leader_id = self.node_id
@@ -260,7 +258,7 @@ class Node(object):
         else:
             entries = []
 
-        return Msg.append_req(
+        return self.append_req(
             self.term, prev_index, prev_term, entries, self.commit_index
         )
 
@@ -269,7 +267,7 @@ class Node(object):
     ):
         # Reject requests with a previous term
         if term < self.term:
-            reply = Msg.append_resp(self.term, False)
+            reply = self.append_resp(self.term, False)
             return [(node_id, reply)]
 
         # Requests with a higher term may convert this node to a follower
@@ -282,7 +280,7 @@ class Node(object):
             if prev_log_index > 0:
                 existing = self.log.lookup(prev_log_index)
                 if existing is None or existing.term != prev_log_term:
-                    reply = Msg.append_resp(self.term, False)
+                    reply = self.append_resp(self.term, False)
                     return [(node_id, reply)]
 
             for e_index, e_term, e_item in entries:
@@ -297,7 +295,7 @@ class Node(object):
                 self.commit_index = min(leader_commit, self.log.last_index)
                 self.update_last_applied()
 
-            reply = Msg.append_resp(self.term, True)
+            reply = self.append_resp(self.term, True)
             return [(node_id, reply)]
         else:
             return []
@@ -325,7 +323,7 @@ class Node(object):
         self, node_id, term, last_log_index, last_log_term
     ):
         if term < self.term:
-            reply = Msg.vote_resp(self.term, False)
+            reply = self.vote_resp(self.term, False)
             return [(node_id, reply)]
 
         self.maybe_become_follower(term, node_id)
@@ -336,9 +334,9 @@ class Node(object):
         ):
             self.reset_election_timeout()
             self.voted_for = node_id
-            return [(node_id, Msg.vote_resp(self.term, True))]
+            return [(node_id, self.vote_resp(self.term, True))]
         else:
-            return [(node_id, Msg.vote_resp(self.term, False))]
+            return [(node_id, self.vote_resp(self.term, False))]
 
     def on_vote_resp(self, node_id, term, success):
         self.maybe_become_follower(term, node_id)
@@ -373,10 +371,10 @@ class Node(object):
 
         elif self.leader_id is not None:
             # We think we know who the leader is, forward request
-            msgs = [(self.leader_id, Msg.propose_req(items))]
+            msgs = [(self.leader_id, self.propose_req(items))]
         else:
             # Leader unknown, fail request
-            msgs = [(node_id, Msg.propose_resp(False))]
+            msgs = [(node_id, self.propose_resp(False))]
 
         return msgs
 
