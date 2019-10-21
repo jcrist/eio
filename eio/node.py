@@ -5,6 +5,7 @@ from .channel import start_server
 
 class rpc(object):
     """Register a method as an RPC handler"""
+
     def __init__(self, fn):
         self.fn = fn
 
@@ -15,6 +16,7 @@ class rpc(object):
 
 class RPCServer(object):
     """A node in a cluster."""
+
     def __init__(self, address):
         self.address = address
 

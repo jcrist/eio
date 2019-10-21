@@ -7,7 +7,7 @@ import traceback
 import msgpack
 
 
-__all__ = ('new_channel', 'start_server', 'Request', 'Channel', 'RemoteException')
+__all__ = ("new_channel", "start_server", "Request", "Channel", "RemoteException")
 
 
 # Message types
@@ -24,6 +24,7 @@ def _encode(data, _p=msgpack.Packer(use_bin_type=True)):
 
 class RemoteException(Exception):
     """A remote exception that occurs on a different machine"""
+
     pass
 
 
@@ -49,7 +50,7 @@ async def new_channel(addr, *, loop=None, timeout=0, **kwargs):
         loop = asyncio.get_event_loop()
 
     if timeout is None:
-        timeout = float('inf')
+        timeout = float("inf")
 
     def factory():
         return ChannelProtocol(loop=loop)
@@ -63,7 +64,7 @@ async def new_channel(addr, *, loop=None, timeout=0, **kwargs):
         args = (factory, addr)
         connect_errors = FileNotFoundError
     else:
-        raise ValueError('Unknown address type: %s' % addr)
+        raise ValueError("Unknown address type: %s" % addr)
 
     retry_interval = 0.5
     start_time = time.monotonic()
@@ -110,7 +111,7 @@ async def start_server(addr, handler, *, loop=None, **kwargs):
     elif isinstance(addr, str):
         return await loop.create_unix_server(factory, addr, **kwargs)
     else:
-        raise ValueError('Unknown address type: %s' % addr)
+        raise ValueError("Unknown address type: %s" % addr)
 
 
 class ChannelProtocol(asyncio.Protocol):
@@ -136,7 +137,7 @@ class ChannelProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc=None):
         if exc is None:
-            exc = ConnectionResetError('Connection closed')
+            exc = ConnectionResetError("Connection closed")
         self.channel._set_exception(exc)
         self._connection_lost = exc
 
@@ -181,6 +182,7 @@ class Channel(object):
 
     Use ``new_channel`` to create a channel.
     """
+
     def __init__(self, protocol, transport, loop):
         self._protocol = protocol
         self._transport = transport
@@ -243,7 +245,7 @@ class Channel(object):
         if not self._queue:
             if self._waiter is not None:
                 raise RuntimeError(
-                    'Channel.recv may only be called by one coroutine at a time'
+                    "Channel.recv may only be called by one coroutine at a time"
                 )
             self._waiter = self._loop.create_future()
             try:
@@ -292,9 +294,7 @@ class Channel(object):
                     message.set_exception(RemoteException(content))
 
         else:
-            self._set_exception(
-                RuntimeError('Invalid message type %d' % msg_type)
-            )
+            self._set_exception(RuntimeError("Invalid message type %d" % msg_type))
 
     def _set_exception(self, exc):
         if self._exception:
@@ -317,6 +317,7 @@ class Channel(object):
 
 class Request(object):
     """A client request."""
+
     __slots__ = ("_channel", "_content", "msg_id")
 
     def __init__(self, channel, content, msg_id):
@@ -369,11 +370,9 @@ class Request(object):
         if exception and message:
             raise ValueError("Cannot provide both message and exception")
         elif exception is not None:
-            message = ''.join(
+            message = "".join(
                 traceback.format_exception(
-                    exception.__class__,
-                    exception,
-                    exception.__traceback__
+                    exception.__class__, exception, exception.__traceback__
                 )
             )
         elif message is None:
