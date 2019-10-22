@@ -94,7 +94,7 @@ class Comm(object):
 
         host, port = self.address.split(":")
 
-        retry_interval = 0.5
+        retry_interval = 0.1
         while True:
             try:
                 transport, protocol = await loop.create_connection(

@@ -1,6 +1,20 @@
 import enum
 import random
+import logging
+
 from collections import namedtuple
+
+
+def get_default_logger():
+    log = logging.getLogger(__name__)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    if log.hasHandlers():
+        return
+    handler = logging.StreamHandler()
+    log.addHandler(handler)
+    return log
+
 
 Entry = namedtuple("Entry", ("index", "term", "item"))
 
@@ -65,7 +79,7 @@ class Peer(object):
 
 class RaftNode(object):
     def __init__(self, node_id, peer_node_ids, heartbeat_ticks=1, election_ticks=None,
-                 random_state=None):
+                 random_state=None, logger=None):
         self.node_id = node_id
         self.peers = {n: Peer() for n in peer_node_ids}
         self.leader_id = None
@@ -74,6 +88,9 @@ class RaftNode(object):
         if random_state is None:
             random_state = random.Random()
         self.random = random_state
+
+        # Logging
+        self.logger = logger or get_default_logger()
 
         # Timing ticks
         if heartbeat_ticks <= 0:
@@ -203,13 +220,17 @@ class RaftNode(object):
             peer.voted = False
 
     def become_follower(self, leader_id=None):
-        print("Now I'm a follower")
         self.reset()
         self.state = State.FOLLOWER
         self.leader_id = leader_id
 
+        self.logger.info(
+            "Server %s transitioned to follower, term %s",
+            self.node_id,
+            self.term
+        )
+
     def become_candidate(self):
-        print("Now I'm a candidate")
         self.reset()
         self.state = State.CANDIDATE
         self.leader_id = None
@@ -217,11 +238,22 @@ class RaftNode(object):
         self.voted_for = self.node_id
         self.vote_count = 1
 
+        self.logger.info(
+            "Server %s transitioned to candidate, term %s",
+            self.node_id,
+            self.term
+        )
+
     def become_leader(self):
-        print("Now I'm a leader")
         self.reset()
         self.state = State.LEADER
         self.leader_id = self.node_id
+
+        self.logger.info(
+            "Server %s transitioned to leader, term %s",
+            self.node_id,
+            self.term
+        )
 
     def update_commit_index(self):
         for N in range(self.commit_index + 1, self.log.last_index + 1):
