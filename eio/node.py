@@ -7,18 +7,11 @@ from .raft import RaftNode
 from .utils import cancel_task
 
 
-class RaftProtocol(asyncio.Protocol):
+class ServerProtocol(asyncio.Protocol):
     def __init__(self, server):
         super().__init__()
-        self.transport = None
         self.server = server
         self._unpacker = msgpack.Unpacker(raw=False)
-
-    def connection_made(self, transport):
-        pass
-
-    def connection_lost(self, exc=None):
-        pass
 
     def data_received(self, data):
         self._unpacker.feed(data)
@@ -27,13 +20,11 @@ class RaftProtocol(asyncio.Protocol):
 
 
 class CommProtocol(asyncio.Protocol):
-    def __init__(self, comm=None, one_way=True, *, loop=None):
+    def __init__(self, comm=None, *, loop=None):
         super().__init__()
         self.transport = None
         self.comm = comm
-        self.one_way = one_way
         self._loop = loop
-        self._unpacker = msgpack.Unpacker(raw=False)
         self._paused = False
         self._yield_cycler = itertools.cycle(range(50))
         self._drain_waiter = None
@@ -50,12 +41,6 @@ class CommProtocol(asyncio.Protocol):
                     waiter.set_result(None)
 
         self.comm._maybe_reconnect()
-
-    def data_received(self, data):
-        if not self.one_way:
-            self._unpacker.feed(data)
-            for msg in self._unpacker:
-                self.comm._append_msg(msg)
 
     def pause_writing(self):
         self._paused = True
@@ -130,6 +115,10 @@ class Comm(object):
             self._transport.write(self._packer.pack(msg))
             await self._protocol.drain()
 
+    def send_sync(self, msg):
+        if self._connected:
+            self._transport.write(self._packer.pack(msg))
+
     async def close(self):
         """Close the comm and release all resources."""
         if not self.closed:
@@ -148,7 +137,7 @@ class Comm(object):
 
 
 class Server(object):
-    def __init__(self, address, peers=None, tick_period=0.25):
+    def __init__(self, address, peers=None, tick_period=0.1):
         self.address = address
         self.peers = peers
         self.raft = RaftNode(self.address, self.peers)
@@ -163,7 +152,7 @@ class Server(object):
         self._ticker = asyncio.ensure_future(self.tick_loop())
         loop = asyncio.get_running_loop()
         host, port = self.address.split(":")
-        server = await loop.create_server(lambda: RaftProtocol(self), host, port)
+        server = await loop.create_server(lambda: ServerProtocol(self), host, port)
         self.server = server
 
     async def stop(self):
@@ -174,8 +163,7 @@ class Server(object):
 
     def on_message(self, msg):
         for node, m in self.raft.on_message(msg):
-            # TODO: don't do this
-            asyncio.ensure_future(self.send(node, m))
+            self.comms[node].send_sync(m)
 
     async def send(self, node_id, msg):
         await self.comms[node_id].send(msg)
