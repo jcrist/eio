@@ -1,8 +1,11 @@
+import asyncio
 import enum
 import random
 import logging
 
 from collections import namedtuple
+
+from .utils import id_generator, prefix_for_id
 
 
 def get_default_logger():
@@ -69,20 +72,44 @@ class Log(object):
             del self.entries[i:]
 
 
+class StateMachine(object):
+    def apply(self, item):
+        print(f"Processing {item}")
+        return item + 1
+
+
 class Peer(object):
     """Information about a peer node"""
     def __init__(self, match_index=0, next_index=0, voted=False):
         self.match_index = match_index
         self.next_index = next_index
         self.voted = voted
+        self.done_requests = set()
+
+    def request_already_done(self, req_id):
+        return req_id in self.done_requests
+
+    def add_done_request(self, req_id):
+        self.done_requests.add(req_id)
+
+    def update_done_requests(self, last_req_id):
+        # TODO: more efficient data structure
+        self.done_requests = set(
+            i for i in self.done_requests if i > last_req_id
+        )
 
 
 class RaftNode(object):
     def __init__(self, node_id, peer_node_ids, heartbeat_ticks=1, election_ticks=None,
-                 random_state=None, logger=None):
+                 random_state=None, logger=None, loop=None):
         self.node_id = node_id
         self.peers = {n: Peer() for n in peer_node_ids}
+        self.pending = {}
+        self.last_req_id = 0
         self.leader_id = None
+        self.req_id_generator = id_generator(self.node_id)
+        self.state_machine = StateMachine()
+        self.loop = loop or asyncio.get_event_loop()
 
         # Random state
         if random_state is None:
@@ -142,11 +169,17 @@ class RaftNode(object):
     def vote_resp(self, term, success):
         return (Msg.VOTE_RESP, self.node_id, term, success)
 
-    def propose_req(self, items):
-        return (Msg.PROPOSE_REQ, self.node_id, items)
+    def propose_req(self, req_id, item, last_req_id):
+        return (Msg.PROPOSE_REQ, self.node_id, req_id, item, last_req_id)
 
-    def propose_resp(self, success):
-        return (Msg.PROPOSE_RESP, self.node_id, success)
+    def propose_resp(self, req_id, item, leader_id):
+        return (Msg.PROPOSE_RESP, self.node_id, req_id, item, leader_id)
+
+    def create_future(self):
+        return self.loop.create_future()
+
+    def next_request_id(self):
+        return next(self.req_id_generator)
 
     def on_message(self, msg):
         """Called when a new message is received.
@@ -190,6 +223,20 @@ class RaftNode(object):
                 ]
 
         return msgs
+
+    def propose(self, item):
+        req_id = self.next_request_id()
+        future = self.create_future()
+        self.pending[req_id] = future
+
+        if self.leader_id is None:
+            msgs = self.on_propose_resp(self.node_id, req_id, item, None)
+        elif self.state == State.LEADER:
+            msgs = self.on_propose_req(self.node_id, req_id, item)
+        else:
+            msgs = [(self.leader_id, self.propose_req(req_id, item, self.last_req_id))]
+
+        return future, msgs
 
     def reset_heartbeat_timeout(self):
         self.elapsed_ticks = 0
@@ -269,8 +316,23 @@ class RaftNode(object):
             self.apply_entry(entry)
             self.last_applied += 1
 
-    def apply_entry(self, item):
-        pass
+    def apply_entry(self, entry):
+        req_id, item, last_req_id = entry.item
+        node_id = prefix_for_id(req_id)
+        if node_id == self.node_id:
+            if req_id > self.last_req_id:
+                resp = self.state_machine.apply(item)
+                fut = self.pending.pop(req_id)
+                if not fut.done():
+                    fut.set_result(resp)
+                self.last_req_id = req_id
+            else:
+                assert req_id not in self.pending
+        else:
+            peer = self.peers.get(node_id)
+            if peer is not None and not peer.request_already_done(req_id):
+                self.state_machine.apply(item)
+                peer.add_done_request(req_id)
 
     def maybe_become_follower(self, term, leader_id=None):
         if term > self.term:
@@ -388,29 +450,39 @@ class RaftNode(object):
                         ]
         return msgs
 
-    def on_propose_req(self, node_id, items):
+    def on_propose_req(self, node_id, req_id, item, last_req_id):
         if self.state == State.LEADER:
-            # This node is the leader, apply directly
-            index = self.log.last_index
-            for item in items:
-                index += 1
-                self.log.append(Entry(index, self.term, item))
+            # This node thinks it is the leader, apply directly
+            index = self.log.last_index + 1
+            self.log.append(Entry(index, self.term, (req_id, item, last_req_id)))
 
             msgs = [
                 (node_id, self._make_append_req(peer))
                 for (node_id, peer) in self.peers.items()
             ]
 
-        elif self.leader_id is not None:
-            # We think we know who the leader is, forward request
-            msgs = [(self.leader_id, self.propose_req(items))]
         else:
-            # Leader unknown, fail request
-            msgs = [(node_id, self.propose_resp(False))]
+            # We're not the leader, respond accordingly
+            msgs = [(node_id, self.propose_resp(req_id, item, self.leader_id))]
 
         return msgs
 
-    def on_propose_resp(self, node_id, success):
-        # TODO: proposals need to be handled on a higher-level (including req
-        # ids and node up/down awareness). No-op this for now.
-        pass
+    def on_propose_resp(self, node_id, req_id, item, leader_id):
+        fut = self.pending.get(req_id)
+        msgs = []
+        if fut is not None and not fut.done():
+            if leader_id is not None:
+                # Retry with new leader
+                msgs = [(leader_id, self.propose_req(req_id, item, self.last_req_id))]
+            else:
+                fut.set_exception(ValueError("Leader unknown"))
+                del self.pending[req_id]
+                if req_id > self.last_req_id:
+                    self.last_req_id = req_id
+        else:
+            # Future already done, move on
+            if fut is not None:
+                del self.pending[req_id]
+            if req_id > self.last_req_id:
+                self.last_req_id = req_id
+        return msgs

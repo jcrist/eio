@@ -137,12 +137,17 @@ class Comm(object):
 
 
 class Server(object):
-    def __init__(self, address, peers=None, tick_period=0.1):
+    def __init__(self, address, peers, tick_period=0.1):
+        assert address in peers
         self.address = address
+        self.node_id = peers.index(address)
         self.peers = peers
-        self.raft = RaftNode(self.address, self.peers)
+        self.raft = RaftNode(
+            self.node_id,
+            [i for (i, p) in enumerate(self.peers) if p != self.address]
+        )
         self.tick_period = tick_period
-        self.comms = {p: Comm(p) for p in self.peers}
+        self.comms = {i: Comm(p) for i, p in enumerate(self.peers) if p != self.address}
         self._ticker = None
         self.server = None
 
@@ -175,6 +180,12 @@ class Server(object):
             for node, msg in msgs:
                 await self.send(node, msg)
 
+    async def propose(self, item):
+        fut, msgs = self.raft.propose(item)
+        for n, m in msgs:
+            await self.send(n, m)
+        return await fut
+
     async def serve_forever(self):
         try:
             await self.serve()
@@ -189,11 +200,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("address", help="Address to serve at")
     parser.add_argument("--peer", help="Add a peer address", action="append")
+    parser.add_argument("--client", help="Act as a client as well", action="store_true", default=False)
 
     args = parser.parse_args()
 
-    async def main(address, peers):
+    async def main(address, peers, client=False):
         server = Server(address, peers=peers)
-        await server.serve_forever()
+        if client:
+            await server.serve()
+            i = 0
+            while server.raft.leader_id is None:
+                await asyncio.sleep(1)
+            import time
+            start = time.time()
+            for _ in range(2000):
+                try:
+                    i = await server.propose(i)
+                except Exception as exc:
+                    pass
+            stop = time.time()
+            print("Took %f" % (stop - start))
+        else:
+            await server.serve_forever()
 
-    asyncio.run(main(args.address, args.peer))
+    asyncio.run(main(args.address, args.peer, args.client))

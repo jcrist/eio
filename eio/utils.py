@@ -45,8 +45,7 @@ def id_generator(prefix, prefix_bits=10, counter_bits=10):
         raise ValueError("prefix requires more than %d bits" % prefix_bits)
     suffix_bits = 64 - prefix_bits
     time_bits = 64 - (prefix_bits + counter_bits)
-    prefix_mask = (2 ** prefix_bits) - 1
-    prefix = (prefix & prefix_mask) << suffix_bits
+    prefix = prefix << suffix_bits
     time_ms = int(time.time() * 1000)
     time_mask = (2 ** time_bits) - 1
     timestamp = (time_ms & time_mask) << counter_bits
@@ -54,3 +53,7 @@ def id_generator(prefix, prefix_bits=10, counter_bits=10):
     while True:
         yield val
         val += 1
+
+
+def prefix_for_id(id, prefix_bits=10):
+    return id >> (64 - prefix_bits)
