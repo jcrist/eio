@@ -8,9 +8,6 @@ from collections import namedtuple
 from .utils import id_generator, prefix_for_id
 
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s.%(msecs)03d %(levelname)-8s: %(message)s", datefmt="%H:%M:%S")
-
-
 def get_default_logger():
     log = logging.getLogger(__name__)
     log.setLevel(logging.INFO)
@@ -18,8 +15,10 @@ def get_default_logger():
     if log.hasHandlers():
         return
     handler = logging.StreamHandler()
-    formatter = logging.Formatter(fmt='%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
-                                  datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = logging.Formatter(
+        fmt='%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     handler.setFormatter(formatter)
     log.addHandler(handler)
     return log
@@ -32,6 +31,11 @@ class State(enum.IntEnum):
     FOLLOWER = 0
     CANDIDATE = 1
     LEADER = 2
+
+
+class PeerState(enum.IntEnum):
+    PROBE = 0
+    REPLICATE = 1
 
 
 class Msg(enum.IntEnum):
@@ -85,15 +89,56 @@ class StateMachine(object):
 
 class Peer(object):
     """Information about a peer node"""
-    def __init__(self, match_index=0, next_index=0, voted=False):
-        self.match_index = match_index
-        self.next_index = next_index
-        self.voted = voted
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.state = PeerState.PROBE
+        self.match_index = 0
+        self.next_index = 0
+        self.voted = False
         self.done_requests = set()
         self.recently_messaged = False
 
     def __repr__(self):
         return "Peer<match_index=%d, next_index=%d>" % (self.match_index, self.next_index)
+
+    def reset(self, last_index):
+        self.state = PeerState.PROBE
+        self.match_index = 0
+        self.next_index = last_index + 1
+        self.voted = False
+
+    def become_probe(self):
+        self.state = PeerState.PROBE
+        self.next_index = self.match_index + 1
+
+    def become_replicate(self):
+        self.state = PeerState.REPLICATE
+        self.next_index = self.match_index + 1
+
+    def maybe_update_index(self, index):
+        update = self.match_index < index
+        if update:
+            self.match_index = index
+        if self.next_index < index + 1:
+            self.next_index = index + 1
+        return update
+
+    def optimistic_update_index(self, n):
+        self.next_index = n + 1
+
+    def maybe_decrement_index(self, rejected):
+        if self.state == PeerState.REPLICATE:
+            if self.match_index >= rejected:
+                return False
+            else:
+                self.next_index = self.match_index + 1
+                return True
+        else:
+            if self.next_index - 1 != rejected:
+                return False
+            else:
+                self.next_index = min(rejected - 1, 1)
+                return True
 
     def request_already_done(self, req_id):
         return req_id in self.done_requests
@@ -110,15 +155,16 @@ class Peer(object):
 
 class RaftNode(object):
     def __init__(self, node_id, peer_node_ids, heartbeat_ticks=1, election_ticks=None,
-                 random_state=None, logger=None, loop=None):
+                 max_entries_per_msg=5, random_state=None, logger=None, loop=None):
         self.node_id = node_id
-        self.peers = {n: Peer() for n in peer_node_ids}
+        self.peers = {n: Peer(n) for n in peer_node_ids}
         self.pending = {}
         self.last_req_id = 0
         self.leader_id = None
         self.req_id_generator = id_generator(self.node_id)
         self.state_machine = StateMachine()
         self.loop = loop or asyncio.get_event_loop()
+        self.max_entries_per_msg = max_entries_per_msg
 
         # Random state
         if random_state is None:
@@ -169,8 +215,8 @@ class RaftNode(object):
             leader_commit
         )
 
-    def append_resp(self, term, success):
-        return (Msg.APPEND_RESP, self.node_id, term, success)
+    def append_resp(self, term, success, index):
+        return (Msg.APPEND_RESP, self.node_id, term, success, index)
 
     def vote_req(self, term, last_log_index, last_log_term):
         return (Msg.VOTE_REQ, self.node_id, term, last_log_index, last_log_term)
@@ -216,11 +262,7 @@ class RaftNode(object):
         if self.state == State.LEADER:
             if self.elapsed_ticks >= self.heartbeat_timeout:
                 self.reset_heartbeat_timeout()
-                msgs = [
-                    (n, self._make_append_req(p, set_recent=False))
-                    for (n, p) in self.peers.items()
-                    if not p.recently_messaged
-                ]
+                msgs = self.broadcast_append(is_heartbeat=True)
         else:
             if self.elapsed_ticks >= self.election_timeout:
                 self.become_candidate()
@@ -238,6 +280,11 @@ class RaftNode(object):
         req_id = self.next_request_id()
         future = self.create_future()
         self.pending[req_id] = future
+
+        self.logger.debug(
+            "Creating proposal [req_id: %d, item: %r]",
+            req_id, item
+        )
 
         if self.leader_id is None:
             msgs = self.on_propose_resp(self.node_id, req_id, item, None)
@@ -272,9 +319,7 @@ class RaftNode(object):
 
         # Reset all peers
         for peer in self.peers.values():
-            peer.next_index = self.log.last_index + 1
-            peer.match_index = 0
-            peer.voted = False
+            peer.reset(self.log.last_index)
 
     def become_follower(self, leader_id=None):
         self.reset()
@@ -331,6 +376,10 @@ class RaftNode(object):
 
     def apply_entry(self, entry):
         req_id, item, last_req_id = entry.item
+        self.logger.debug(
+            "Applying entry [req_id: %d, item: %r, last_req_id: %d]",
+            req_id, item, last_req_id
+        )
         node_id = prefix_for_id(req_id)
         if node_id == self.node_id:
             if req_id > self.last_req_id:
@@ -355,28 +404,60 @@ class RaftNode(object):
     def is_majority(self, n):
         return n >= len(self.peers) / 2
 
-    def _make_append_req(self, peer, set_recent=True):
+    def _make_append_reqs(self, peer, is_heartbeat=False):
+        if is_heartbeat and peer.recently_messaged:
+            peer.recently_messaged = False
+            return []
+
         prev_index = peer.next_index - 1
         prev_entry = self.log.lookup(prev_index)
         prev_term = prev_entry.term if prev_entry is not None else 0
 
-        if self.log.last_index >= peer.next_index:
-            entries = [self.log.lookup(peer.next_index)]
+        if peer.state == PeerState.PROBE:
+            if self.log.last_index >= peer.next_index:
+                entries = [self.log.lookup(peer.next_index)]
+            else:
+                entries = []
         else:
-            entries = []
+            entries = [
+                self.log.lookup(i) for i in range(
+                    peer.next_index,
+                    min(
+                        self.max_entries_per_msg + peer.next_index,
+                        self.log.last_index
+                    ) + 1
+                )
+            ]
+            if entries:
+                peer.optimistic_update_index(entries[-1].index)
 
-        peer.recently_messaged = set_recent
+        if not is_heartbeat and not entries:
+            return []
 
-        return self.append_req(
+        peer.recently_messaged = not is_heartbeat
+
+        req = self.append_req(
             self.term, prev_index, prev_term, entries, self.commit_index
         )
+        return [(peer.node_id, req)]
+
+    def broadcast_append(self, is_heartbeat=False):
+        msgs = []
+        for peer in self.peers.values():
+            msgs.extend(self._make_append_reqs(peer, is_heartbeat=is_heartbeat))
+        return msgs
 
     def on_append_req(
         self, node_id, term, prev_log_index, prev_log_term, entries, leader_commit
     ):
+        self.logger.debug(
+            "Received append request: [node_id: %d, term: %d, prev_log_index: %d, "
+            "prev_log_term: %d, entries: %r, leader_commit: %d]",
+            node_id, term, prev_log_index, prev_log_term, entries, leader_commit
+        )
         # Reject requests with a previous term
         if term < self.term:
-            reply = self.append_resp(self.term, False)
+            reply = self.append_resp(self.term, False, None)
             return [(node_id, reply)]
 
         # Requests with a higher term may convert this node to a follower
@@ -389,7 +470,7 @@ class RaftNode(object):
             if prev_log_index > 0:
                 existing = self.log.lookup(prev_log_index)
                 if existing is None or existing.term != prev_log_term:
-                    reply = self.append_resp(self.term, False)
+                    reply = self.append_resp(self.term, False, prev_log_index + 1)
                     return [(node_id, reply)]
 
             for e_index, e_term, e_item in entries:
@@ -404,34 +485,49 @@ class RaftNode(object):
                 self.commit_index = min(leader_commit, self.log.last_index)
                 self.update_last_applied()
 
-            reply = self.append_resp(self.term, True)
+            reply = self.append_resp(self.term, True, self.log.last_index)
             return [(node_id, reply)]
         else:
             return []
 
-    def on_append_resp(self, node_id, term, success):
+    def on_append_resp(self, node_id, term, success, index):
+        self.logger.debug(
+            "Received append response: [node_id: %d, term: %d, success: %s]",
+            node_id, term, success
+        )
         self.maybe_become_follower(term, node_id)
 
-        msgs = []
-        if self.state == State.LEADER:
-            peer = self.peers[node_id]
-            commit_index_updated = False
-            if success:
-                peer.next_index = self.log.last_index + 1
-                peer.match_index = self.log.last_index
-                commit_index_updated = self.update_commit_index()
-                self.update_last_applied()
-            elif peer.next_index > 2:
-                peer.next_index -= 1
+        if self.state != State.LEADER:
+            return []
 
-            if self.log.last_index >= peer.next_index or commit_index_updated:
-                req = self._make_append_req(peer)
-                msgs = [(node_id, req)]
+        peer = self.peers[node_id]
+
+        msgs = []
+        if success:
+            if peer.maybe_update_index(index):
+                if peer.state == PeerState.PROBE:
+                    peer.become_replicate()
+
+                if self.update_commit_index():
+                    self.update_last_applied()
+                    msgs.extend(self.broadcast_append())
+        else:
+            if peer.maybe_decrement_index(index):
+                if peer.state == PeerState.REPLICATE:
+                    peer.become_probe()
+
+        msgs.extend(self._make_append_reqs(peer))
+
         return msgs
 
     def on_vote_req(
         self, node_id, term, last_log_index, last_log_term
     ):
+        self.logger.debug(
+            "Received vote request: [node_id: %d, term: %d, "
+            "last_log_index: %d, last_log_term: %d]",
+            node_id, term, last_log_index, last_log_term
+        )
         if term < self.term:
             reply = self.vote_resp(self.term, False)
             return [(node_id, reply)]
@@ -449,6 +545,10 @@ class RaftNode(object):
             return [(node_id, self.vote_resp(self.term, False))]
 
     def on_vote_resp(self, node_id, term, success):
+        self.logger.debug(
+            "Received vote response: [node_id: %d, term: %d, success: %s]",
+            node_id, term, success,
+        )
         self.maybe_become_follower(term, node_id)
 
         msgs = []
@@ -460,23 +560,20 @@ class RaftNode(object):
                     self.vote_count += 1
                     if self.vote_count >= self.is_majority(self.vote_count):
                         self.become_leader()
-                        msgs = [
-                            (node_id, self._make_append_req(peer))
-                            for (node_id, peer) in self.peers.items()
-                        ]
+                        msgs = self.broadcast_append()
         return msgs
 
     def on_propose_req(self, node_id, req_id, item, last_req_id):
+        self.logger.debug(
+            "Received propose request: [node_id: %d, req_id: %d, "
+            "item: %r, last_req_id: %d]",
+            node_id, req_id, item, last_req_id
+        )
         if self.state == State.LEADER:
             # This node thinks it is the leader, apply directly
             index = self.log.last_index + 1
             self.log.append(Entry(index, self.term, (req_id, item, last_req_id)))
-
-            msgs = [
-                (node_id, self._make_append_req(peer))
-                for (node_id, peer) in self.peers.items()
-            ]
-
+            msgs = self.broadcast_append()
         else:
             # We're not the leader, respond accordingly
             msgs = [(node_id, self.propose_resp(req_id, item, self.leader_id))]
@@ -484,6 +581,11 @@ class RaftNode(object):
         return msgs
 
     def on_propose_resp(self, node_id, req_id, item, leader_id):
+        self.logger.debug(
+            "Received propose response: [node_id: %d, req_id: %d, "
+            "item: %r, leader_id: %d]",
+            node_id, req_id, item, leader_id
+        )
         fut = self.pending.get(req_id)
         msgs = []
         if fut is not None and not fut.done():

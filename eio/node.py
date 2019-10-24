@@ -137,7 +137,7 @@ class Comm(object):
 
 
 class Server(object):
-    def __init__(self, address, peers, tick_period=1):
+    def __init__(self, address, peers, tick_period=0.1):
         assert address in peers
         self.address = address
         self.node_id = peers.index(address)
@@ -214,7 +214,7 @@ if __name__ == "__main__":
             import time
             start = time.time()
             i = 0
-            N = 100
+            N = 10
             M = 2
             for _ in range(N):
                 tasks = [server.propose(i) for _ in range(M)]
@@ -229,4 +229,4 @@ if __name__ == "__main__":
             while True:
                 await asyncio.sleep(0.5)
 
-    asyncio.run(main(args.address, args.peer, args.client), debug=True)
+    asyncio.run(main(args.address, args.peer, args.client))
