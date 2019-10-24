@@ -84,7 +84,7 @@ class Log(object):
 
 class StateMachine(object):
     def apply(self, item):
-        return item + 1
+        pass
 
 
 class Peer(object):
@@ -154,7 +154,7 @@ class Peer(object):
 
 
 class RaftNode(object):
-    def __init__(self, node_id, peer_node_ids, heartbeat_ticks=1, election_ticks=None,
+    def __init__(self, node_id, peer_node_ids, state_machine, heartbeat_ticks=1, election_ticks=None,
                  max_entries_per_msg=5, random_state=None, logger=None, loop=None):
         self.node_id = node_id
         self.peers = {n: Peer(n) for n in peer_node_ids}
@@ -162,7 +162,7 @@ class RaftNode(object):
         self.last_req_id = 0
         self.leader_id = None
         self.req_id_generator = id_generator(self.node_id)
-        self.state_machine = StateMachine()
+        self.state_machine = state_machine
         self.loop = loop or asyncio.get_event_loop()
         self.max_entries_per_msg = max_entries_per_msg
 

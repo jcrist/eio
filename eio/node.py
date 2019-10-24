@@ -137,14 +137,15 @@ class Comm(object):
 
 
 class Server(object):
-    def __init__(self, address, peers, tick_period=0.1):
-        assert address in peers
-        self.address = address
-        self.node_id = peers.index(address)
+    def __init__(self, node_id, peers, state_machine, tick_period=0.1, **kwargs):
+        self.node_id = node_id
+        self.address = peers[node_id]
         self.peers = peers
         self.raft = RaftNode(
             self.node_id,
-            [i for (i, p) in enumerate(self.peers) if p != self.address]
+            [i for (i, p) in enumerate(self.peers) if i != self.node_id],
+            state_machine,
+            **kwargs
         )
         self.tick_period = tick_period
         self.comms = {i: Comm(p) for i, p in enumerate(self.peers) if p != self.address}
@@ -193,40 +194,3 @@ class Server(object):
             await self.server.serve_forever()
         finally:
             await self.stop()
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("address", help="Address to serve at")
-    parser.add_argument("--peer", help="Add a peer address", action="append")
-    parser.add_argument("--client", help="Act as a client as well", action="store_true", default=False)
-
-    args = parser.parse_args()
-
-    async def main(address, peers, client=False):
-        server = Server(address, peers=peers)
-        await server.serve()
-        while server.raft.leader_id is None:
-            await asyncio.sleep(1)
-        if server.raft.leader_id == server.raft.node_id:
-            import time
-            start = time.time()
-            i = 0
-            N = 10
-            M = 2
-            for _ in range(N):
-                tasks = [server.propose(i) for _ in range(M)]
-                i += 1
-                try:
-                    await asyncio.gather(*tasks)
-                except Exception as exc:
-                    print(exc)
-            stop = time.time()
-            print("Took %f" % (stop - start))
-        else:
-            while True:
-                await asyncio.sleep(0.5)
-
-    asyncio.run(main(args.address, args.peer, args.client))
