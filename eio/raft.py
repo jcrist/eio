@@ -134,11 +134,8 @@ class Peer(object):
                 self.next_index = self.match_index + 1
                 return True
         else:
-            if self.next_index - 1 != rejected:
-                return False
-            else:
-                self.next_index = min(rejected - 1, 1)
-                return True
+            self.next_index = max(rejected - 1, 1)
+            return True
 
     def request_already_done(self, req_id):
         return req_id in self.done_requests
@@ -384,8 +381,8 @@ class RaftNode(object):
         if node_id == self.node_id:
             if req_id > self.last_req_id:
                 resp = self.state_machine.apply(item)
-                fut = self.pending.pop(req_id)
-                if not fut.done():
+                fut = self.pending.pop(req_id, None)
+                if fut and not fut.done():
                     fut.set_result(resp)
                 self.last_req_id = req_id
             else:
@@ -492,8 +489,8 @@ class RaftNode(object):
 
     def on_append_resp(self, node_id, term, success, index):
         self.logger.debug(
-            "Received append response: [node_id: %d, term: %d, success: %s]",
-            node_id, term, success
+            "Received append response: [node_id: %d, term: %d, success: %s, index: %s]",
+            node_id, term, success, index
         )
         self.maybe_become_follower(term, node_id)
 
