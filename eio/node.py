@@ -137,7 +137,7 @@ class Comm(object):
 
 
 class Server(object):
-    def __init__(self, address, peers, tick_period=0.1):
+    def __init__(self, address, peers, tick_period=1):
         assert address in peers
         self.address = address
         self.node_id = peers.index(address)
@@ -184,7 +184,8 @@ class Server(object):
         fut, msgs = self.raft.propose(item)
         for n, m in msgs:
             await self.send(n, m)
-        return await fut
+        res = await fut
+        return res
 
     async def serve_forever(self):
         try:
@@ -206,21 +207,26 @@ if __name__ == "__main__":
 
     async def main(address, peers, client=False):
         server = Server(address, peers=peers)
-        if client:
-            await server.serve()
-            i = 0
-            while server.raft.leader_id is None:
-                await asyncio.sleep(1)
+        await server.serve()
+        while server.raft.leader_id is None:
+            await asyncio.sleep(1)
+        if server.raft.leader_id == server.raft.node_id:
             import time
             start = time.time()
-            for _ in range(2000):
+            i = 0
+            N = 100
+            M = 2
+            for _ in range(N):
+                tasks = [server.propose(i) for _ in range(M)]
+                i += 1
                 try:
-                    i = await server.propose(i)
+                    await asyncio.gather(*tasks)
                 except Exception as exc:
-                    pass
+                    print(exc)
             stop = time.time()
             print("Took %f" % (stop - start))
         else:
-            await server.serve_forever()
+            while True:
+                await asyncio.sleep(0.5)
 
-    asyncio.run(main(args.address, args.peer, args.client))
+    asyncio.run(main(args.address, args.peer, args.client), debug=True)

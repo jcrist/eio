@@ -8,6 +8,9 @@ from collections import namedtuple
 from .utils import id_generator, prefix_for_id
 
 
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s.%(msecs)03d %(levelname)-8s: %(message)s", datefmt="%H:%M:%S")
+
+
 def get_default_logger():
     log = logging.getLogger(__name__)
     log.setLevel(logging.INFO)
@@ -15,6 +18,9 @@ def get_default_logger():
     if log.hasHandlers():
         return
     handler = logging.StreamHandler()
+    formatter = logging.Formatter(fmt='%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
+                                  datefmt='%Y-%m-%d %H:%M:%S')
+    handler.setFormatter(formatter)
     log.addHandler(handler)
     return log
 
@@ -74,7 +80,6 @@ class Log(object):
 
 class StateMachine(object):
     def apply(self, item):
-        print(f"Processing {item}")
         return item + 1
 
 
@@ -85,6 +90,10 @@ class Peer(object):
         self.next_index = next_index
         self.voted = voted
         self.done_requests = set()
+        self.recently_messaged = False
+
+    def __repr__(self):
+        return "Peer<match_index=%d, next_index=%d>" % (self.match_index, self.next_index)
 
     def request_already_done(self, req_id):
         return req_id in self.done_requests
@@ -208,8 +217,9 @@ class RaftNode(object):
             if self.elapsed_ticks >= self.heartbeat_timeout:
                 self.reset_heartbeat_timeout()
                 msgs = [
-                    (node_id, self._make_append_req(peer))
-                    for (node_id, peer) in self.peers.items()
+                    (n, self._make_append_req(p, set_recent=False))
+                    for (n, p) in self.peers.items()
+                    if not p.recently_messaged
                 ]
         else:
             if self.elapsed_ticks >= self.election_timeout:
@@ -232,7 +242,7 @@ class RaftNode(object):
         if self.leader_id is None:
             msgs = self.on_propose_resp(self.node_id, req_id, item, None)
         elif self.state == State.LEADER:
-            msgs = self.on_propose_req(self.node_id, req_id, item)
+            msgs = self.on_propose_req(self.node_id, req_id, item, self.last_req_id)
         else:
             msgs = [(self.leader_id, self.propose_req(req_id, item, self.last_req_id))]
 
@@ -303,12 +313,15 @@ class RaftNode(object):
         )
 
     def update_commit_index(self):
+        updated = False
         for N in range(self.commit_index + 1, self.log.last_index + 1):
             count = sum(1 for p in self.peers.values() if p.match_index >= N)
             entry = self.log.lookup(N)
             entry_term = entry.term if entry else 0
             if self.is_majority(count) and self.term == entry_term:
                 self.commit_index = N
+                updated = True
+        return updated
 
     def update_last_applied(self):
         for index in range(self.last_applied + 1, self.commit_index + 1):
@@ -342,7 +355,7 @@ class RaftNode(object):
     def is_majority(self, n):
         return n >= len(self.peers) / 2
 
-    def _make_append_req(self, peer):
+    def _make_append_req(self, peer, set_recent=True):
         prev_index = peer.next_index - 1
         prev_entry = self.log.lookup(prev_index)
         prev_term = prev_entry.term if prev_entry is not None else 0
@@ -351,6 +364,8 @@ class RaftNode(object):
             entries = [self.log.lookup(peer.next_index)]
         else:
             entries = []
+
+        peer.recently_messaged = set_recent
 
         return self.append_req(
             self.term, prev_index, prev_term, entries, self.commit_index
@@ -400,15 +415,16 @@ class RaftNode(object):
         msgs = []
         if self.state == State.LEADER:
             peer = self.peers[node_id]
+            commit_index_updated = False
             if success:
                 peer.next_index = self.log.last_index + 1
                 peer.match_index = self.log.last_index
-                self.update_commit_index()
+                commit_index_updated = self.update_commit_index()
                 self.update_last_applied()
             elif peer.next_index > 2:
                 peer.next_index -= 1
 
-            if self.log.last_index >= peer.next_index:
+            if self.log.last_index >= peer.next_index or commit_index_updated:
                 req = self._make_append_req(peer)
                 msgs = [(node_id, req)]
         return msgs
