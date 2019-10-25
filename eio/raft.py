@@ -16,8 +16,8 @@ def get_default_logger():
         return
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
-        fmt='%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        fmt="%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(formatter)
     log.addHandler(handler)
@@ -89,6 +89,7 @@ class StateMachine(object):
 
 class Peer(object):
     """Information about a peer node"""
+
     def __init__(self, node_id):
         self.node_id = node_id
         self.state = PeerState.PROBE
@@ -99,7 +100,10 @@ class Peer(object):
         self.recently_messaged = False
 
     def __repr__(self):
-        return "Peer<match_index=%d, next_index=%d>" % (self.match_index, self.next_index)
+        return "Peer<match_index=%d, next_index=%d>" % (
+            self.match_index,
+            self.next_index,
+        )
 
     def reset(self, last_index):
         self.state = PeerState.PROBE
@@ -145,14 +149,22 @@ class Peer(object):
 
     def update_done_requests(self, last_req_id):
         # TODO: more efficient data structure
-        self.done_requests = set(
-            i for i in self.done_requests if i > last_req_id
-        )
+        self.done_requests = set(i for i in self.done_requests if i > last_req_id)
 
 
 class RaftNode(object):
-    def __init__(self, node_id, peer_node_ids, state_machine, heartbeat_ticks=1, election_ticks=None,
-                 max_entries_per_msg=5, random_state=None, logger=None, loop=None):
+    def __init__(
+        self,
+        node_id,
+        peer_node_ids,
+        state_machine,
+        heartbeat_ticks=1,
+        election_ticks=None,
+        max_entries_per_msg=5,
+        random_state=None,
+        logger=None,
+        loop=None,
+    ):
         self.node_id = node_id
         self.peers = {n: Peer(n) for n in peer_node_ids}
         self.pending = {}
@@ -209,7 +221,7 @@ class RaftNode(object):
             prev_log_index,
             prev_log_term,
             entries,
-            leader_commit
+            leader_commit,
         )
 
     def append_resp(self, term, success, index):
@@ -266,7 +278,9 @@ class RaftNode(object):
                 msgs = [
                     (
                         node,
-                        self.vote_req(self.term, self.log.last_index, self.log.last_term)
+                        self.vote_req(
+                            self.term, self.log.last_index, self.log.last_term
+                        ),
                     )
                     for node in self.peers
                 ]
@@ -278,10 +292,7 @@ class RaftNode(object):
         future = self.create_future()
         self.pending[req_id] = future
 
-        self.logger.debug(
-            "Creating proposal [req_id: %d, item: %r]",
-            req_id, item
-        )
+        self.logger.debug("Creating proposal [req_id: %d, item: %r]", req_id, item)
 
         if self.leader_id is None:
             msgs = self.on_propose_resp(self.node_id, req_id, item, None)
@@ -299,8 +310,7 @@ class RaftNode(object):
         # The election timeout is in [election_ticks, election_ticks * 2]
         self.elapsed_ticks = 0
         self.election_timeout = self.random.randint(
-            self.election_ticks,
-            2 * self.election_ticks
+            self.election_ticks, 2 * self.election_ticks
         )
 
     def reset(self):
@@ -324,9 +334,7 @@ class RaftNode(object):
         self.leader_id = leader_id
 
         self.logger.info(
-            "Server %s transitioned to follower, term %s",
-            self.node_id,
-            self.term
+            "Server %s transitioned to follower, term %s", self.node_id, self.term
         )
 
     def become_candidate(self):
@@ -338,9 +346,7 @@ class RaftNode(object):
         self.vote_count = 1
 
         self.logger.info(
-            "Server %s transitioned to candidate, term %s",
-            self.node_id,
-            self.term
+            "Server %s transitioned to candidate, term %s", self.node_id, self.term
         )
 
     def become_leader(self):
@@ -349,9 +355,7 @@ class RaftNode(object):
         self.leader_id = self.node_id
 
         self.logger.info(
-            "Server %s transitioned to leader, term %s",
-            self.node_id,
-            self.term
+            "Server %s transitioned to leader, term %s", self.node_id, self.term
         )
 
     def update_commit_index(self):
@@ -375,7 +379,9 @@ class RaftNode(object):
         req_id, item, last_req_id = entry.item
         self.logger.debug(
             "Applying entry [req_id: %d, item: %r, last_req_id: %d]",
-            req_id, item, last_req_id
+            req_id,
+            item,
+            last_req_id,
         )
         node_id = prefix_for_id(req_id)
         if node_id == self.node_id:
@@ -417,12 +423,11 @@ class RaftNode(object):
                 entries = []
         else:
             entries = [
-                self.log.lookup(i) for i in range(
+                self.log.lookup(i)
+                for i in range(
                     peer.next_index,
-                    min(
-                        self.max_entries_per_msg + peer.next_index,
-                        self.log.last_index
-                    ) + 1
+                    min(self.max_entries_per_msg + peer.next_index, self.log.last_index)
+                    + 1,
                 )
             ]
             if entries:
@@ -450,7 +455,12 @@ class RaftNode(object):
         self.logger.debug(
             "Received append request: [node_id: %d, term: %d, prev_log_index: %d, "
             "prev_log_term: %d, entries: %r, leader_commit: %d]",
-            node_id, term, prev_log_index, prev_log_term, entries, leader_commit
+            node_id,
+            term,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
         )
         # Reject requests with a previous term
         if term < self.term:
@@ -490,7 +500,10 @@ class RaftNode(object):
     def on_append_resp(self, node_id, term, success, index):
         self.logger.debug(
             "Received append response: [node_id: %d, term: %d, success: %s, index: %s]",
-            node_id, term, success, index
+            node_id,
+            term,
+            success,
+            index,
         )
         self.maybe_become_follower(term, node_id)
 
@@ -517,13 +530,14 @@ class RaftNode(object):
 
         return msgs
 
-    def on_vote_req(
-        self, node_id, term, last_log_index, last_log_term
-    ):
+    def on_vote_req(self, node_id, term, last_log_index, last_log_term):
         self.logger.debug(
             "Received vote request: [node_id: %d, term: %d, "
             "last_log_index: %d, last_log_term: %d]",
-            node_id, term, last_log_index, last_log_term
+            node_id,
+            term,
+            last_log_index,
+            last_log_term,
         )
         if term < self.term:
             reply = self.vote_resp(self.term, False)
@@ -544,7 +558,9 @@ class RaftNode(object):
     def on_vote_resp(self, node_id, term, success):
         self.logger.debug(
             "Received vote response: [node_id: %d, term: %d, success: %s]",
-            node_id, term, success,
+            node_id,
+            term,
+            success,
         )
         self.maybe_become_follower(term, node_id)
 
@@ -564,7 +580,10 @@ class RaftNode(object):
         self.logger.debug(
             "Received propose request: [node_id: %d, req_id: %d, "
             "item: %r, last_req_id: %d]",
-            node_id, req_id, item, last_req_id
+            node_id,
+            req_id,
+            item,
+            last_req_id,
         )
         if self.state == State.LEADER:
             # This node thinks it is the leader, apply directly
@@ -581,7 +600,10 @@ class RaftNode(object):
         self.logger.debug(
             "Received propose response: [node_id: %d, req_id: %d, "
             "item: %r, leader_id: %d]",
-            node_id, req_id, item, leader_id
+            node_id,
+            req_id,
+            item,
+            leader_id,
         )
         fut = self.pending.get(req_id)
         msgs = []

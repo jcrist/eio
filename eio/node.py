@@ -77,9 +77,7 @@ class Comm(object):
     def connect(self):
         if self._connect_task and not self._connect_task.done():
             return
-        self._connect_task = asyncio.ensure_future(
-            self._connect()
-        )
+        self._connect_task = asyncio.ensure_future(self._connect())
 
     def _maybe_reconnect(self):
         if not self.closed:
@@ -97,9 +95,7 @@ class Comm(object):
         retry_interval = 0.1
         while True:
             try:
-                transport, protocol = await loop.create_connection(
-                    factory, host, port
-                )
+                transport, protocol = await loop.create_connection(factory, host, port)
                 break
             except (ConnectionRefusedError, OSError):
                 await asyncio.sleep(retry_interval)

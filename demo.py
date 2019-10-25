@@ -34,18 +34,18 @@ class KVServer(object):
         self.server = server
 
     async def put(self, request):
-        key = request.match_info['key']
+        key = request.match_info["key"]
         value = await request.content.read()
         await self.server.propose(("PUT", key, value))
         return web.Response(status=201)
 
     async def delete(self, request):
-        key = request.match_info['key']
+        key = request.match_info["key"]
         await self.server.propose(("DEL", key))
         return web.Response(status=204)
 
     async def get(self, request):
-        key = request.match_info['key']
+        key = request.match_info["key"]
         value = await self.server.propose(("GET", key))
         if value is None:
             return web.Response(status=404)
@@ -57,7 +57,9 @@ def main():
     parser.add_argument("node_id", help="Which node this is", type=int)
     parser.add_argument("port", help="What port to serve on", type=int)
     parser.add_argument("--peer", help="Add a peer address", action="append")
-    parser.add_argument("--debug", help="Whether to log debug output", action="store_true")
+    parser.add_argument(
+        "--debug", help="Whether to log debug output", action="store_true"
+    )
 
     args = parser.parse_args()
 
@@ -66,8 +68,8 @@ def main():
     logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
-        fmt='%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        fmt="%(asctime)s.%(msecs)03d %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -77,7 +79,9 @@ def main():
         l.addHandler(handler)
 
     # Construct the application
-    server = Server(args.node_id, peers=args.peer, state_machine=KVStore(logger), logger=logger)
+    server = Server(
+        args.node_id, peers=args.peer, state_machine=KVStore(logger), logger=logger
+    )
     kvserver = KVServer(server)
     app = web.Application(logger=logger)
     app.router.add_route("GET", "/{key}", kvserver.get)
