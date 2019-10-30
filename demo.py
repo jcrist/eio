@@ -1,10 +1,6 @@
 import argparse
 import logging
 
-import uvloop
-
-uvloop.install()
-
 from aiohttp import web
 
 from eio.node import Server
@@ -80,8 +76,15 @@ def main():
     parser.add_argument(
         "--debug", help="Whether to log debug output", action="store_true"
     )
+    parser.add_argument(
+        "--uvloop", help="Whether to use uvloop", action="store_true"
+    )
 
     args = parser.parse_args()
+
+    if args.uvloop:
+        import uvloop
+        uvloop.install()
 
     # Setup a logger
     logger = logging.getLogger("demo")

@@ -350,17 +350,9 @@ class RaftNode(object):
                 msgs = []
             elif self.state == State.LEADER:
                 if self.has_committed_entry_this_term():
-                    ro = ReadOnly(
-                        node_id=self.node_id,
-                        req_id=req_id,
-                        index=self.commit_index,
-                        resps=set(),
-                        item=item,
-                        future=future,
+                    msgs = self.schedule_readonly(
+                        self.node_id, req_id, item=item, future=future
                     )
-                    self.readonly_map[ro.req_id] = ro
-                    self.readonly_queue.append(ro)
-                    msgs = self.broadcast_append(send_empty=True)
                 else:
                     future.set_exception(
                         ValueError("Leader hasn't committed anything yet this term")
@@ -500,6 +492,34 @@ class RaftNode(object):
                 self.state_machine.apply(item)
                 peer.add_done_request(req_id)
 
+    def schedule_readonly(self, node_id, req_id, item=None, future=None):
+        ro = ReadOnly(
+            node_id=node_id,
+            req_id=req_id,
+            index=self.commit_index,
+            resps=set(),
+            item=item,
+            future=future,
+        )
+        self.readonly_map[ro.req_id] = ro
+        self.readonly_queue.append(ro)
+        return self.broadcast_append(send_empty=True)
+
+    def process_readonly(self, ro, index=None):
+        if ro.future.done():
+            return
+
+        if index is None:
+            index = ro.index
+
+        if index <= self.last_applied:
+            # Read is ready now, apply
+            res = self.state_machine.apply_read(ro.item)
+            ro.future.set_result(res)
+        else:
+            # Read will be ready later
+            self.readindex_map[index].append(ro)
+
     def maybe_become_follower(self, term, leader_id=None):
         if term > self.term:
             self.term = term
@@ -638,15 +658,8 @@ class RaftNode(object):
                     ro = self.readonly_queue.popleft()
                     del self.readonly_map[ro.req_id]
 
-                    if ro.future is not None and not ro.future.done():
-                        # Local request
-                        if ro.index <= self.last_applied:
-                            # Read is ready now, apply
-                            res = self.state_machine.apply_read(ro.item)
-                            ro.future.set_result(res)
-                        else:
-                            # Read will be ready later
-                            self.readindex_map[index].append(ro)
+                    if ro.future is not None:
+                        self.process_readonly(ro)
                     else:
                         # Remote request, return read index
                         reply = self.readindex_resp(ro.req_id, ro.index, None)
@@ -774,17 +787,7 @@ class RaftNode(object):
             "Received readindex request: [node_id: %d, req_id: %d]", node_id, req_id
         )
         if self.state == State.LEADER and self.has_committed_entry_this_term():
-            ro = ReadOnly(
-                node_id=node_id,
-                req_id=req_id,
-                index=self.commit_index,
-                resps=set(),
-                item=None,
-                future=None,
-            )
-            self.readonly_map[ro.req_id] = ro
-            self.readonly_queue.append(ro)
-            msgs = self.broadcast_append(send_empty=True)
+            msgs = self.schedule_readonly(node_id, req_id)
         else:
             # We're either not the leader, or we are the leader but aren't
             # quite ready to take requests. Respond accordingly.
@@ -800,7 +803,6 @@ class RaftNode(object):
             req_id,
             index,
         )
-        msgs = []
         ro = self.readonly_map.pop(req_id, None)
         if ro is not None and not ro.future.done():
             if index is None:
@@ -810,14 +812,8 @@ class RaftNode(object):
                 else:
                     # Retry with new leader
                     self.readonly_map[ro.req_id] = ro
-                    msgs = [(leader_id, self.readindex_req(req_id))]
+                    return [(leader_id, self.readindex_req(req_id))]
             else:
-                if index <= self.last_applied:
-                    # Read is ready now, apply
-                    res = self.state_machine.apply_read(ro.item)
-                    ro.future.set_result(res)
-                else:
-                    # Read will be ready later
-                    self.readindex_map[index].append(ro)
+                self.process_readonly(ro, index=index)
 
-        return msgs
+        return []
