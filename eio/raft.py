@@ -390,6 +390,21 @@ class RaftNode(object):
             self.election_ticks, 2 * self.election_ticks
         )
 
+    def reset_client_requests(self):
+        exc = ValueError("Leadership changed during request, please retry")
+        # Reset any pending read requests
+        self.readonly_queue.clear()
+        for m in [self.readonly_map, self.readindex_map]:
+            for ro in m.values():
+                if ro.future is not None and not ro.future.done():
+                    ro.set_exception(exc)
+            m.clear()
+
+        # Reset any pending propose requests
+        for f in self.pending.values():
+            f.set_exception(exc)
+        self.pending.clear()
+
     def reset(self):
         # Reset all timers
         self.reset_election_timeout()
@@ -404,6 +419,9 @@ class RaftNode(object):
         # Reset all peers
         for peer in self.peers.values():
             peer.reset(self.log.last_index)
+
+        # Reset client requests
+        self.reset_client_requests()
 
     def become_follower(self, leader_id=None):
         self.reset()
