@@ -1,6 +1,10 @@
 import argparse
 import logging
 
+import uvloop
+
+uvloop.install()
+
 from aiohttp import web
 
 from eio.node import Server
@@ -25,7 +29,15 @@ class KVStore(StateMachine):
             self.kv.pop(key, None)
         elif cmd.upper() == "GET":
             key, = args
-            self.logger.info("GET: [key: %s]", key)
+            self.logger.info("GET(propose): [key: %s]", key)
+            return self.kv.get(key)
+
+    def apply_read(self, entry):
+        cmd = entry[0]
+        args = entry[1:]
+        if cmd.upper() == "GET":
+            key, = args
+            self.logger.info("GET(read): [key: %s]", key)
             return self.kv.get(key)
 
 
@@ -46,7 +58,15 @@ class KVServer(object):
 
     async def get(self, request):
         key = request.match_info["key"]
-        value = await self.server.propose(("GET", key))
+        read = request.rel_url.query.get("read", "global")
+        if read == "global":
+            value = await self.server.read(("GET", key))
+        elif read == "local":
+            value = await self.server.read(("GET", key), local=True)
+        elif read == "propose":
+            value = await self.server.propose(("GET", key))
+        else:
+            value = None
         if value is None:
             return web.Response(status=404)
         return web.Response(body=value)
@@ -56,7 +76,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("node_id", help="Which node this is", type=int)
     parser.add_argument("port", help="What port to serve on", type=int)
-    parser.add_argument("--peer", help="Add a peer address", action="append")
+    parser.add_argument("--initial", help="Specify initial raft ports, comma separated")
     parser.add_argument(
         "--debug", help="Whether to log debug output", action="store_true"
     )
@@ -79,8 +99,9 @@ def main():
         l.addHandler(handler)
 
     # Construct the application
+    peers = ["127.0.0.1:%s" % p for p in args.initial.split(",")]
     server = Server(
-        args.node_id, peers=args.peer, state_machine=KVStore(logger), logger=logger
+        args.node_id, peers=peers, state_machine=KVStore(logger), logger=logger
     )
     kvserver = KVServer(server)
     app = web.Application(logger=logger)

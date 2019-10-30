@@ -3,7 +3,7 @@ import enum
 import random
 import logging
 
-from collections import namedtuple
+from collections import namedtuple, deque, defaultdict
 
 from .utils import id_generator, prefix_for_id
 
@@ -23,6 +23,10 @@ def get_default_logger():
     log.addHandler(handler)
     return log
 
+
+ReadOnly = namedtuple(
+    "ReadOnly", ("node_id", "req_id", "index", "resps", "item", "future")
+)
 
 Entry = namedtuple("Entry", ("index", "term", "item"))
 
@@ -45,6 +49,8 @@ class Msg(enum.IntEnum):
     VOTE_RESP = 3
     PROPOSE_REQ = 4
     PROPOSE_RESP = 5
+    READINDEX_REQ = 6
+    READINDEX_RESP = 7
 
 
 class Log(object):
@@ -84,6 +90,9 @@ class Log(object):
 
 class StateMachine(object):
     def apply(self, item):
+        pass
+
+    def apply_read(self, item):
         pass
 
 
@@ -175,6 +184,14 @@ class RaftNode(object):
         self.loop = loop or asyncio.get_event_loop()
         self.max_entries_per_msg = max_entries_per_msg
 
+        # Read-only requests
+        # - A queue of ReadOnly objects
+        self.readonly_queue = deque()
+        # - A map of request_id -> ReadOnly objects
+        self.readonly_map = {}
+        # - A map of readindex -> List[ReadOnly]
+        self.readindex_map = defaultdict(list)
+
         # Random state
         if random_state is None:
             random_state = random.Random()
@@ -208,12 +225,16 @@ class RaftNode(object):
             Msg.VOTE_RESP: self.on_vote_resp,
             Msg.PROPOSE_REQ: self.on_propose_req,
             Msg.PROPOSE_RESP: self.on_propose_resp,
+            Msg.READINDEX_REQ: self.on_readindex_req,
+            Msg.READINDEX_RESP: self.on_readindex_resp,
         }
 
         # Initialize as a follower
         self.become_follower()
 
-    def append_req(self, term, prev_log_index, prev_log_term, entries, leader_commit):
+    def append_req(
+        self, term, prev_log_index, prev_log_term, entries, leader_commit, tag
+    ):
         return (
             Msg.APPEND_REQ,
             self.node_id,
@@ -222,10 +243,11 @@ class RaftNode(object):
             prev_log_term,
             entries,
             leader_commit,
+            tag,
         )
 
-    def append_resp(self, term, success, index):
-        return (Msg.APPEND_RESP, self.node_id, term, success, index)
+    def append_resp(self, term, success, index, tag):
+        return (Msg.APPEND_RESP, self.node_id, term, success, index, tag)
 
     def vote_req(self, term, last_log_index, last_log_term):
         return (Msg.VOTE_REQ, self.node_id, term, last_log_index, last_log_term)
@@ -238,6 +260,12 @@ class RaftNode(object):
 
     def propose_resp(self, req_id, item, leader_id):
         return (Msg.PROPOSE_RESP, self.node_id, req_id, item, leader_id)
+
+    def readindex_req(self, req_id):
+        return (Msg.READINDEX_REQ, self.node_id, req_id)
+
+    def readindex_resp(self, req_id, index, leader_id):
+        return (Msg.READINDEX_RESP, self.node_id, req_id, index, leader_id)
 
     def create_future(self):
         return self.loop.create_future()
@@ -300,6 +328,55 @@ class RaftNode(object):
             msgs = self.on_propose_req(self.node_id, req_id, item, self.last_req_id)
         else:
             msgs = [(self.leader_id, self.propose_req(req_id, item, self.last_req_id))]
+
+        return future, msgs
+
+    def read(self, item, local=False):
+        if local:
+            future = self.create_future()
+            res = self.state_machine.apply_read(item)
+            future.set_result(res)
+            msgs = []
+        else:
+            req_id = self.next_request_id()
+            future = self.create_future()
+
+            self.logger.debug(
+                "Creating read-only request [req_id: %d, item: %r]", req_id, item
+            )
+
+            if self.leader_id is None:
+                future.set_exception(ValueError("Leader unknown"))
+                msgs = []
+            elif self.state == State.LEADER:
+                if self.has_committed_entry_this_term():
+                    ro = ReadOnly(
+                        node_id=self.node_id,
+                        req_id=req_id,
+                        index=self.commit_index,
+                        resps=set(),
+                        item=item,
+                        future=future,
+                    )
+                    self.readonly_map[ro.req_id] = ro
+                    self.readonly_queue.append(ro)
+                    msgs = self.broadcast_append(send_empty=True)
+                else:
+                    future.set_exception(
+                        ValueError("Leader hasn't committed anything yet this term")
+                    )
+                    msgs = []
+            else:
+                ro = ReadOnly(
+                    node_id=self.node_id,
+                    req_id=req_id,
+                    index=None,
+                    resps=None,
+                    item=item,
+                    future=future,
+                )
+                self.readonly_map[ro.req_id] = ro
+                msgs = [(self.leader_id, self.readindex_req(req_id))]
 
         return future, msgs
 
@@ -374,8 +451,14 @@ class RaftNode(object):
             entry = self.log.lookup(index)
             self.apply_entry(entry)
             self.last_applied += 1
+            # Apply any pending reads
+            for ro in self.readindex_map.pop(self.last_applied, ()):
+                res = self.state_machine.apply_read(ro.item)
+                ro.future.set_result(res)
 
     def apply_entry(self, entry):
+        if entry.item is None:
+            return
         req_id, item, last_req_id = entry.item
         self.logger.debug(
             "Applying entry [req_id: %d, item: %r, last_req_id: %d]",
@@ -407,7 +490,11 @@ class RaftNode(object):
     def is_majority(self, n):
         return n >= len(self.peers) / 2
 
-    def _make_append_reqs(self, peer, is_heartbeat=False):
+    def has_committed_entry_this_term(self):
+        committed = self.log.lookup(self.commit_index)
+        return committed is not None and committed.term == self.term
+
+    def _make_append_reqs(self, peer, is_heartbeat=False, send_empty=False):
         if is_heartbeat and peer.recently_messaged:
             peer.recently_messaged = False
             return []
@@ -433,24 +520,33 @@ class RaftNode(object):
             if entries:
                 peer.optimistic_update_index(entries[-1].index)
 
-        if not is_heartbeat and not entries:
+        if not entries and not is_heartbeat and not send_empty:
             return []
 
         peer.recently_messaged = not is_heartbeat
 
+        if self.readonly_queue:
+            tag = self.readonly_queue[-1].req_id
+        else:
+            tag = None
+
         req = self.append_req(
-            self.term, prev_index, prev_term, entries, self.commit_index
+            self.term, prev_index, prev_term, entries, self.commit_index, tag
         )
         return [(peer.node_id, req)]
 
-    def broadcast_append(self, is_heartbeat=False):
+    def broadcast_append(self, is_heartbeat=False, send_empty=False):
         msgs = []
         for peer in self.peers.values():
-            msgs.extend(self._make_append_reqs(peer, is_heartbeat=is_heartbeat))
+            msgs.extend(
+                self._make_append_reqs(
+                    peer, is_heartbeat=is_heartbeat, send_empty=send_empty
+                )
+            )
         return msgs
 
     def on_append_req(
-        self, node_id, term, prev_log_index, prev_log_term, entries, leader_commit
+        self, node_id, term, prev_log_index, prev_log_term, entries, leader_commit, tag
     ):
         self.logger.debug(
             "Received append request: [node_id: %d, term: %d, prev_log_index: %d, "
@@ -464,7 +560,7 @@ class RaftNode(object):
         )
         # Reject requests with a previous term
         if term < self.term:
-            reply = self.append_resp(self.term, False, None)
+            reply = self.append_resp(self.term, False, None, tag)
             return [(node_id, reply)]
 
         # Requests with a higher term may convert this node to a follower
@@ -477,7 +573,7 @@ class RaftNode(object):
             if prev_log_index > 0:
                 existing = self.log.lookup(prev_log_index)
                 if existing is None or existing.term != prev_log_term:
-                    reply = self.append_resp(self.term, False, prev_log_index + 1)
+                    reply = self.append_resp(self.term, False, prev_log_index + 1, tag)
                     return [(node_id, reply)]
 
             for e_index, e_term, e_item in entries:
@@ -492,12 +588,12 @@ class RaftNode(object):
                 self.commit_index = min(leader_commit, self.log.last_index)
                 self.update_last_applied()
 
-            reply = self.append_resp(self.term, True, self.log.last_index)
+            reply = self.append_resp(self.term, True, self.log.last_index, tag)
             return [(node_id, reply)]
         else:
             return []
 
-    def on_append_resp(self, node_id, term, success, index):
+    def on_append_resp(self, node_id, term, success, index, tag):
         self.logger.debug(
             "Received append response: [node_id: %d, term: %d, success: %s, index: %s]",
             node_id,
@@ -510,9 +606,37 @@ class RaftNode(object):
         if self.state != State.LEADER:
             return []
 
-        peer = self.peers[node_id]
-
         msgs = []
+
+        peer = self.peers[node_id]
+        ro = self.readonly_map.get(tag)
+        if ro is not None:
+            ro.resps.add(node_id)
+            if self.is_majority(len(ro.resps) + 1):
+                # We have now heard from a majority of nodes that the index is
+                # this far, which means all read requests up to `tag` have been
+                # accounted for.
+                while self.readonly_queue:
+                    ro = self.readonly_queue.popleft()
+                    del self.readonly_map[ro.req_id]
+
+                    if ro.future is not None and not ro.future.done():
+                        # Local request
+                        if ro.index <= self.last_applied:
+                            # Read is ready now, apply
+                            res = self.state_machine.apply_read(ro.item)
+                            ro.future.set_result(res)
+                        else:
+                            # Read will be ready later
+                            self.readindex_map[index].append(ro)
+                    else:
+                        # Remote request, return read index
+                        reply = self.readindex_resp(ro.req_id, ro.index, None)
+                        msgs.append((ro.node_id, reply))
+
+                    if ro.req_id == tag:
+                        break
+
         if success:
             if peer.maybe_update_index(index):
                 if peer.state == PeerState.PROBE:
@@ -573,6 +697,9 @@ class RaftNode(object):
                     self.vote_count += 1
                     if self.vote_count >= self.is_majority(self.vote_count):
                         self.become_leader()
+                        # We append an empty entry on leadership transition
+                        index = self.log.last_index + 1
+                        self.log.append(Entry(index, self.term, None))
                         msgs = self.broadcast_append()
         return msgs
 
@@ -622,4 +749,57 @@ class RaftNode(object):
                 del self.pending[req_id]
             if req_id > self.last_req_id:
                 self.last_req_id = req_id
+        return msgs
+
+    def on_readindex_req(self, node_id, req_id):
+        self.logger.debug(
+            "Received readindex request: [node_id: %d, req_id: %d]", node_id, req_id
+        )
+        if self.state == State.LEADER and self.has_committed_entry_this_term():
+            ro = ReadOnly(
+                node_id=node_id,
+                req_id=req_id,
+                index=self.commit_index,
+                resps=set(),
+                item=None,
+                future=None,
+            )
+            self.readonly_map[ro.req_id] = ro
+            self.readonly_queue.append(ro)
+            msgs = self.broadcast_append(send_empty=True)
+        else:
+            # We're either not the leader, or we are the leader but aren't
+            # quite ready to take requests. Respond accordingly.
+            msgs = [(node_id, self.readindex_resp(req_id, None, self.leader_id))]
+
+        return msgs
+
+    def on_readindex_resp(self, node_id, req_id, index, leader_id):
+        self.logger.debug(
+            "Received readindex response: [node_id: %d, req_id: %d, "
+            "index: %s, leader_id: %s]",
+            node_id,
+            req_id,
+            index,
+        )
+        msgs = []
+        ro = self.readonly_map.pop(req_id, None)
+        if ro is not None and not ro.future.done():
+            if index is None:
+                if leader_id is None:
+                    # Leader unknown, error
+                    ro.future.set_exception(ValueError("Leader unknown"))
+                else:
+                    # Retry with new leader
+                    self.readonly_map[ro.req_id] = ro
+                    msgs = [(leader_id, self.readindex_req(req_id))]
+            else:
+                if index <= self.last_applied:
+                    # Read is ready now, apply
+                    res = self.state_machine.apply_read(ro.item)
+                    ro.future.set_result(res)
+                else:
+                    # Read will be ready later
+                    self.readindex_map[index].append(ro)
+
         return msgs

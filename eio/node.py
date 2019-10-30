@@ -184,6 +184,13 @@ class Server(object):
         res = await fut
         return res
 
+    async def read(self, item, local=False):
+        fut, msgs = self.raft.read(item, local=local)
+        for n, m in msgs:
+            await self.send(n, m)
+        res = await fut
+        return res
+
     async def serve_forever(self):
         try:
             await self.serve()
