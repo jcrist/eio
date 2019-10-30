@@ -30,6 +30,8 @@ ReadOnly = namedtuple(
 
 Entry = namedtuple("Entry", ("index", "term", "item"))
 
+Snapshot = namedtuple("Snapshot", ("data", "index", "term"))
+
 
 class State(enum.IntEnum):
     FOLLOWER = 0
@@ -40,6 +42,7 @@ class State(enum.IntEnum):
 class PeerState(enum.IntEnum):
     PROBE = 0
     REPLICATE = 1
+    SNAPSHOT = 2
 
 
 class Msg(enum.IntEnum):
@@ -51,6 +54,8 @@ class Msg(enum.IntEnum):
     PROPOSE_RESP = 5
     READINDEX_REQ = 6
     READINDEX_RESP = 7
+    SNAPSHOT_REQ = 8
+    SNAPSHOT_RESP = 9
 
 
 class Log(object):
@@ -60,8 +65,8 @@ class Log(object):
         self.entries = []
         self.offset = 0
 
-    def append(self, entry):
-        self.entries.append(entry)
+    def append(self, index, term, item):
+        self.entries.append(Entry(index, term, item))
 
     @property
     def last_index(self):
@@ -81,11 +86,21 @@ class Log(object):
             return self.entries[i]
         return None
 
+    def reset(self, offset=0):
+        self.entries = []
+        self.offset = offset
+
     def rollback_to_before(self, index):
         assert index > 0
         i = index - self.offset - 1
         if i >= 0:
             del self.entries[i:]
+
+    def drop_entries(self, index):
+        i = index - self.offset
+        assert i > 0
+        self.entries = self.entries[i:]
+        self.offset = index
 
 
 class StateMachine(object):
@@ -93,6 +108,12 @@ class StateMachine(object):
         pass
 
     def apply_read(self, item):
+        pass
+
+    def create_snapshot(self):
+        pass
+
+    def restore_snapshot(self, snap):
         pass
 
 
@@ -127,6 +148,9 @@ class Peer(object):
     def become_replicate(self):
         self.state = PeerState.REPLICATE
         self.next_index = self.match_index + 1
+
+    def become_snapshot(self):
+        self.state = PeerState.SNAPSHOT
 
     def maybe_update_index(self, index):
         update = self.match_index < index
@@ -170,6 +194,8 @@ class RaftNode(object):
         heartbeat_ticks=1,
         election_ticks=None,
         max_entries_per_msg=5,
+        snapshot_entries=1000,
+        snapshot_overlap_entries=10,
         random_state=None,
         logger=None,
         loop=None,
@@ -183,6 +209,9 @@ class RaftNode(object):
         self.state_machine = state_machine
         self.loop = loop or asyncio.get_event_loop()
         self.max_entries_per_msg = max_entries_per_msg
+        self.snapshot_entries = snapshot_entries
+        self.snapshot_overlap_entries = snapshot_overlap_entries
+        assert snapshot_overlap_entries < snapshot_entries
 
         # Read-only requests
         # - A queue of ReadOnly objects
@@ -214,9 +243,10 @@ class RaftNode(object):
 
         self.term = 0
         self.log = Log()
+        self.snapshot = None
 
         self.commit_index = 0
-        self.last_applied = 0
+        self.applied_index = 0
 
         self.handlers = {
             Msg.APPEND_REQ: self.on_append_req,
@@ -227,6 +257,8 @@ class RaftNode(object):
             Msg.PROPOSE_RESP: self.on_propose_resp,
             Msg.READINDEX_REQ: self.on_readindex_req,
             Msg.READINDEX_RESP: self.on_readindex_resp,
+            Msg.SNAPSHOT_REQ: self.on_snapshot_req,
+            Msg.SNAPSHOT_RESP: self.on_snapshot_resp,
         }
 
         # Initialize as a follower
@@ -266,6 +298,12 @@ class RaftNode(object):
 
     def readindex_resp(self, req_id, index, leader_id):
         return (Msg.READINDEX_RESP, self.node_id, req_id, index, leader_id)
+
+    def snapshot_req(self, term, snap_index, snap_term, snap_data):
+        return (Msg.SNAPSHOT_REQ, self.node_id, term, snap_index, snap_term, snap_data)
+
+    def snapshot_resp(self, term, success, index):
+        return (Msg.SNAPSHOT_RESP, self.node_id, term, success, index)
 
     def create_future(self):
         return self.loop.create_future()
@@ -457,14 +495,25 @@ class RaftNode(object):
         return updated
 
     def update_last_applied(self):
-        for index in range(self.last_applied + 1, self.commit_index + 1):
+        for index in range(self.applied_index + 1, self.commit_index + 1):
             entry = self.log.lookup(index)
             self.apply_entry(entry)
-            self.last_applied += 1
+            self.applied_index += 1
             # Apply any pending reads
-            for ro in self.readindex_map.pop(self.last_applied, ()):
+            for ro in self.readindex_map.pop(self.applied_index, ()):
                 res = self.state_machine.apply_read(ro.item)
                 ro.future.set_result(res)
+            # Maybe take a snapshot
+            if self.applied_index - self.log.offset > self.snapshot_entries:
+                self.logger.info("Creating snapshot up to index %d", self.applied_index)
+                self.snapshot = Snapshot(
+                    data=self.state_machine.create_snapshot(),
+                    index=self.log.last_index,
+                    term=self.log.last_term,
+                )
+                self.log.drop_entries(
+                    self.applied_index - self.snapshot_overlap_entries
+                )
 
     def apply_entry(self, entry):
         if entry.item is None:
@@ -512,7 +561,7 @@ class RaftNode(object):
         if index is None:
             index = ro.index
 
-        if index <= self.last_applied:
+        if index <= self.applied_index:
             # Read is ready now, apply
             res = self.state_machine.apply_read(ro.item)
             ro.future.set_result(res)
@@ -537,9 +586,34 @@ class RaftNode(object):
             peer.recently_messaged = False
             return []
 
+        if peer.state == PeerState.SNAPSHOT:
+            # When in snapshot state, we hold off on messages until we receive
+            # a reply
+            return []
+
         prev_index = peer.next_index - 1
-        prev_entry = self.log.lookup(prev_index)
-        prev_term = prev_entry.term if prev_entry is not None else 0
+        should_snapshot = False
+
+        if self.log.offset < peer.next_index:
+            if self.log.offset < prev_index:
+                prev_term = self.log.lookup(prev_index).term
+            else:
+                assert self.log.offset == prev_index
+                if self.log.offset == 0:
+                    prev_term = 0
+                elif self.snapshot is not None:
+                    prev_term = self.snapshot.term
+                else:
+                    should_snapshot = True
+        else:
+            should_snapshot = True
+
+        if should_snapshot:
+            peer.become_snapshot()
+            req = self.snapshot_req(
+                self.term, self.snapshot.index, self.snapshot.term, self.snapshot.data
+            )
+            return [(peer.node_id, req)]
 
         if peer.state == PeerState.PROBE:
             if self.log.last_index >= peer.next_index:
@@ -608,7 +682,7 @@ class RaftNode(object):
             self.leader_id = node_id
             self.reset_election_timeout()
 
-            if prev_log_index > 0:
+            if prev_log_index > self.log.offset:
                 existing = self.log.lookup(prev_log_index)
                 if existing is None or existing.term != prev_log_term:
                     reply = self.append_resp(self.term, False, prev_log_index + 1, tag)
@@ -617,10 +691,10 @@ class RaftNode(object):
             for e_index, e_term, e_item in entries:
                 existing = self.log.lookup(e_index)
                 if existing is None:
-                    self.log.append(Entry(e_index, e_term, e_item))
+                    self.log.append(e_index, e_term, e_item)
                 elif existing.term != e_term:
                     self.log.rollback_to_before(e_index)
-                    self.log.append(Entry(e_index, e_term, e_item))
+                    self.log.append(e_index, e_term, e_item)
 
             if leader_commit > self.commit_index:
                 self.commit_index = min(leader_commit, self.log.last_index)
@@ -730,7 +804,7 @@ class RaftNode(object):
                         self.become_leader()
                         # We append an empty entry on leadership transition
                         index = self.log.last_index + 1
-                        self.log.append(Entry(index, self.term, None))
+                        self.log.append(index, self.term, None)
                         msgs = self.broadcast_append()
         return msgs
 
@@ -746,7 +820,7 @@ class RaftNode(object):
         if self.state == State.LEADER:
             # This node thinks it is the leader, apply directly
             index = self.log.last_index + 1
-            self.log.append(Entry(index, self.term, (req_id, item, last_req_id)))
+            self.log.append(index, self.term, (req_id, item, last_req_id))
             msgs = self.broadcast_append()
         else:
             # We're not the leader, respond accordingly
@@ -817,3 +891,52 @@ class RaftNode(object):
                 self.process_readonly(ro, index=index)
 
         return []
+
+    def on_snapshot_req(self, node_id, term, snap_index, snap_term, snap_data):
+        self.logger.debug(
+            "Received snapshot request: [node_id: %d, term: %d, "
+            "snap_index: %d, snap_term: %d]",
+            node_id,
+            term,
+            snap_index,
+            snap_term,
+        )
+        # Reject requests with a previous term
+        if term < self.term:
+            reply = self.snapshot_resp(self.term, False, self.commit_index)
+            return [(node_id, reply)]
+
+        self.maybe_become_follower(term, node_id)
+
+        if self.state == State.FOLLOWER:
+            self.reset_election_timeout()
+            if self.commit_index >= snap_index:
+                success = False
+            else:
+                self.leader_id = node_id
+                self.state_machine.restore_snapshot(snap_data)
+                self.log.reset(snap_index)
+                self.commit_index = snap_index
+                self.applied_index = snap_index
+                success = True
+        else:
+            success = False
+
+        reply = self.snapshot_resp(self.term, success, self.commit_index)
+        return [(node_id, reply)]
+
+    def on_snapshot_resp(self, node_id, term, success, index):
+        self.logger.debug(
+            "Received snapshot response: [node_id: %d, term: %d, "
+            "success: %s, index: %d]",
+            node_id,
+            term,
+            success,
+            index,
+        )
+        peer = self.peers[node_id]
+        if success:
+            peer.match_index = index
+            peer.become_probe()
+
+        return self._make_append_reqs(peer)

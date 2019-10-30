@@ -1,5 +1,6 @@
 import argparse
 import logging
+import pickle
 
 from aiohttp import web
 
@@ -35,6 +36,12 @@ class KVStore(StateMachine):
             key, = args
             self.logger.info("GET(read): [key: %s]", key)
             return self.kv.get(key)
+
+    def create_snapshot(self):
+        return pickle.dumps(self.kv, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def restore_snapshot(self, snapshot):
+        self.kv = pickle.loads(snapshot)
 
 
 class KVServer(object):
@@ -76,14 +83,13 @@ def main():
     parser.add_argument(
         "--debug", help="Whether to log debug output", action="store_true"
     )
-    parser.add_argument(
-        "--uvloop", help="Whether to use uvloop", action="store_true"
-    )
+    parser.add_argument("--uvloop", help="Whether to use uvloop", action="store_true")
 
     args = parser.parse_args()
 
     if args.uvloop:
         import uvloop
+
         uvloop.install()
 
     # Setup a logger
